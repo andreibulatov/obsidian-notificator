@@ -2,9 +2,18 @@ import { App, Modal, Plugin, PluginSettingTab, Setting, TFile, MarkdownPostProce
 
 const VIEW_TYPE_CALENDAR = "notificator-calendar-view";
 
+interface ProjectedOccurrence {
+    date: DateTime;
+    comment: string;
+    filePath: string;
+    type: 'past' | 'future';
+}
+
 class CalendarView extends ItemView {
     plugin: NotificatorPlugin;
     currentDate: DateTime;
+    projectedOccurrences: ProjectedOccurrence[] = [];
+    showProjected: boolean = false;
 
     constructor(leaf: WorkspaceLeaf, plugin: NotificatorPlugin) {
         super(leaf);
@@ -49,6 +58,13 @@ class CalendarView extends ItemView {
             this.render();
         };
 
+        const forecastBtn = header.createEl("button", { text: "Forecast 3m" });
+        forecastBtn.onclick = () => {
+            this.calculateProjected();
+            this.showProjected = !this.showProjected;
+            this.render();
+        };
+
         const grid = container.createDiv({ cls: 'notificator-calendar-grid' });
         grid.style.display = "grid";
         grid.style.gridTemplateColumns = "repeat(7, 1fr)";
@@ -86,25 +102,15 @@ class CalendarView extends ItemView {
             );
 
             dayNotifications.forEach(n => {
-                const notifEl = dayEl.createDiv({ cls: 'calendar-notif-dot' });
-                notifEl.style.fontSize = "10px";
-                notifEl.style.cursor = "pointer";
-                notifEl.style.backgroundColor = "var(--interactive-accent)";
-                notifEl.style.color = "var(--text-on-accent)";
-                notifEl.style.borderRadius = "2px";
-                notifEl.style.marginBottom = "1px";
-                notifEl.style.padding = "0 2px";
-                notifEl.style.whiteSpace = "nowrap";
-                notifEl.style.overflow = "hidden";
-                notifEl.style.textOverflow = "ellipsis";
-                notifEl.title = `${n.targetDateTime.toFormat('HH:mm')} ${n.comment}`;
-                notifEl.setText(`${n.targetDateTime.toFormat('HH:mm')}`);
-                
-                notifEl.onclick = (e) => {
-                    e.stopPropagation();
-                    this.app.workspace.openLinkText(n.filePath, n.filePath);
-                };
+                this.renderNotificationDot(dayEl, n.targetDateTime, n.comment, n.filePath, false);
             });
+
+            if (this.showProjected) {
+                const projected = this.projectedOccurrences.filter(p => p.date.hasSame(date, 'day'));
+                projected.forEach(p => {
+                    this.renderNotificationDot(dayEl, p.date, p.comment, p.filePath, true, p.type);
+                });
+            }
         }
 
         container.createEl("hr");
@@ -113,7 +119,23 @@ class CalendarView extends ItemView {
         const list = container.createDiv({ cls: 'notificator-calendar-list' });
         
         // Sort by date
-        const sorted = [...this.plugin.notifications].sort((a, b) => a.targetDateTime.toMillis() - b.targetDateTime.toMillis());
+        let allItems: { date: DateTime, comment: string, filePath: string, status?: string, type?: string }[] = this.plugin.notifications.map(n => ({
+            date: n.targetDateTime,
+            comment: n.comment,
+            filePath: n.filePath,
+            status: n.status
+        }));
+
+        if (this.showProjected) {
+            allItems = allItems.concat(this.projectedOccurrences.map(p => ({
+                date: p.date,
+                comment: p.comment,
+                filePath: p.filePath,
+                type: p.type
+            })));
+        }
+
+        const sorted = allItems.sort((a, b) => a.date.toMillis() - b.date.toMillis());
 
         if (sorted.length === 0) {
             list.createEl("p", { text: "No notifications found." });
@@ -125,11 +147,86 @@ class CalendarView extends ItemView {
             item.style.borderBottom = "1px solid var(--background-modifier-border)";
             item.style.padding = "5px 0";
             
-            const link = item.createEl('a', { text: `${n.targetDateTime.toFormat('dd.MM.yyyy HH:mm')} - ${n.comment}` });
+            const link = item.createEl('a', { text: `${n.date.toFormat('dd.MM.yyyy HH:mm')} - ${n.comment}` });
             link.onclick = () => {
                 this.app.workspace.openLinkText(n.filePath, n.filePath);
             };
-            item.createEl('span', { text: ` [${n.status}]`, cls: `status-${n.status}` });
+            if (n.status) {
+                item.createEl('span', { text: ` [${n.status}]`, cls: `status-${n.status}` });
+            } else if (n.type) {
+                const span = item.createEl('span', { text: ` [${n.type}]`, cls: `status-projected-${n.type}` });
+                span.style.opacity = "0.6";
+                span.style.fontStyle = "italic";
+            }
+        });
+    }
+
+    renderNotificationDot(parent: HTMLElement, date: DateTime, comment: string, filePath: string, isProjected: boolean, type?: 'past' | 'future') {
+        const notifEl = parent.createDiv({ cls: 'calendar-notif-dot' });
+        notifEl.style.fontSize = "10px";
+        notifEl.style.cursor = "pointer";
+        notifEl.style.backgroundColor = isProjected ? (type === 'past' ? "var(--text-muted)" : "var(--interactive-accent-hover)") : "var(--interactive-accent)";
+        notifEl.style.color = "var(--text-on-accent)";
+        notifEl.style.borderRadius = "2px";
+        notifEl.style.marginBottom = "1px";
+        notifEl.style.padding = "0 2px";
+        notifEl.style.whiteSpace = "nowrap";
+        notifEl.style.overflow = "hidden";
+        notifEl.style.textOverflow = "ellipsis";
+        if (isProjected) {
+            notifEl.style.opacity = "0.7";
+        }
+        notifEl.title = `${date.toFormat('HH:mm')} ${comment}${isProjected ? ` (${type})` : ''}`;
+        notifEl.setText(`${date.toFormat('HH:mm')}`);
+        
+        notifEl.onclick = (e) => {
+            e.stopPropagation();
+            this.app.workspace.openLinkText(filePath, filePath);
+        };
+    }
+
+    calculateProjected() {
+        this.projectedOccurrences = [];
+        const now = DateTime.now();
+        const threeMonthsLater = now.plus({ months: 3 });
+
+        this.plugin.notifications.forEach(n => {
+            // Past from history
+            n.history.forEach(h => {
+                // Try to find dates in history details
+                // Format usually is "DD.MM.YYYY HH:mm status"
+                const dateMatch = h.detail.match(/(\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2})/);
+                if (dateMatch) {
+                    const histDate = DateTime.fromFormat(dateMatch[1], 'dd.MM.yyyy HH:mm');
+                    if (histDate.isValid && !histDate.hasSame(n.targetDateTime, 'minute')) {
+                        // Check if we already added it (avoid duplicates)
+                        if (!this.projectedOccurrences.some(p => p.date.hasSame(histDate, 'minute') && p.comment === n.comment)) {
+                            this.projectedOccurrences.push({
+                                date: histDate,
+                                comment: n.comment,
+                                filePath: n.filePath,
+                                type: 'past'
+                            });
+                        }
+                    }
+                }
+            });
+
+            // Future for 3 months
+            if (n.recurrence) {
+                let next = this.plugin.calculateNextOccurrence(n.targetDateTime, n.recurrence);
+                let count = 0;
+                while (next && next <= threeMonthsLater && count < 100) { // Safety break at 100
+                    this.projectedOccurrences.push({
+                        date: next,
+                        comment: n.comment,
+                        filePath: n.filePath,
+                        type: 'future'
+                    });
+                    next = this.plugin.calculateNextOccurrence(next, n.recurrence);
+                    count++;
+                }
+            }
         });
     }
 
@@ -797,6 +894,7 @@ class NotificatorSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
+        containerEl.createEl('a', { text: 'emoji source', href:'https://en.wikipedia.org/wiki/List_of_emojis' });
         containerEl.createEl('h3', { text: 'How to use' });
         const usageList = containerEl.createEl('ul');
         usageList.createEl('li', { text: 'Use the command "Insert Notification" to create a new reminder block.' });
@@ -804,5 +902,6 @@ class NotificatorSettingTab extends PluginSettingTab {
         usageList.createEl('li', { text: 'The plugin scans your notes every minute (configurable) and shows system notifications.' });
         usageList.createEl('li', { text: 'Use the "Calendar View" command to see all upcoming and past notifications.' });
         usageList.createEl('li', { text: 'You can manage notification statuses (OK, Cancel, Postpone) directly in the note block.' });
+
     }
 }
