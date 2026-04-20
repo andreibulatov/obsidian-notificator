@@ -155,6 +155,8 @@ interface NotificationData {
     lineStart: number;
     lineEnd: number;
     lastMissedAlert?: DateTime;
+    shown?: boolean;
+    recurrence?: string;
 }
 
 interface NotificatorSettings {
@@ -200,8 +202,9 @@ export default class NotificatorPlugin extends Plugin {
                 new NotificationModal(this.app, this, (result) => {
                     const now = DateTime.now().toFormat('dd.MM.yyyy HH:mm');
                     const target = `${result.date} ${result.time}`;
+                    const recurrence = result.recurrence ? ` 🔄 ${result.recurrence}` : "";
                     const commentWithEmoji = (result.emoji ? result.emoji + " " : "") + result.comment;
-                    const block = `\`\`\`notifiactor\n${target} ${commentWithEmoji}\n-- history\n${now} created notification - ${target}\n\`\`\``;
+                    const block = `\`\`\`notifiactor\n${target} ${commentWithEmoji}${recurrence}\n-- history\n${now} created notification - ${target}\n\`\`\``;
                     editor.replaceSelection(block);
                 }).open();
             }
@@ -299,12 +302,13 @@ export default class NotificatorPlugin extends Plugin {
         if (lines.length === 0) return null;
         
         const firstLine = lines[0];
-        // Expected format: DD.MM.YYYY HH:mm Comment
-        const match = firstLine.match(/^(\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2})\s*(.*)$/);
+        // Expected format: DD.MM.YYYY HH:mm Comment [🔄 Recurrence]
+        const match = firstLine.match(/^(\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2})\s*(.*?)(?:\s*🔄\s*(.*))?$/);
         if (!match) return null;
 
         const targetStr = match[1];
-        const comment = match[2];
+        const comment = match[2].trim();
+        const recurrence = match[3] ? match[3].trim() : undefined;
         const targetDateTime = DateTime.fromFormat(targetStr, 'dd.MM.yyyy HH:mm');
 
         const history: NotificationHistory[] = [];
@@ -346,7 +350,8 @@ export default class NotificatorPlugin extends Plugin {
             history,
             filePath,
             lineStart,
-            lineEnd
+            lineEnd,
+            recurrence
         };
     }
 
@@ -363,7 +368,7 @@ export default class NotificatorPlugin extends Plugin {
         container.style.borderRadius = "4px";
 
         const header = container.createDiv({ cls: 'notificator-header' });
-        header.createEl('b', { text: `${data.targetDateTime.toFormat('dd.MM.yyyy HH:mm')} - ${data.status.toUpperCase()}` });
+        header.createEl('b', { text: `${data.targetDateTime.toFormat('dd.MM.yyyy HH:mm')}${data.recurrence ? ' 🔄 ' + data.recurrence : ''} - ${data.status.toUpperCase()}` });
         container.createEl('div', { text: data.comment });
 
         const historyEl = container.createEl('details');
@@ -389,13 +394,13 @@ export default class NotificatorPlugin extends Plugin {
                         await this.updateNotificationStatus(ctx.sourcePath, source, `postpone - ${newTime}`, newTime);
                     }).open();
                 } else {
-                    await this.updateNotificationStatus(ctx.sourcePath, source, actionDetail);
+                    await this.updateNotificationStatus(ctx.sourcePath, source, actionDetail, undefined, data.recurrence);
                 }
             };
         });
     }
 
-    async updateNotificationStatus(filePath: string, oldSource: string, statusDetail: string, newTargetTime?: string) {
+    async updateNotificationStatus(filePath: string, oldSource: string, statusDetail: string, newTargetTime?: string, recurrence?: string) {
         const file = this.app.vault.getAbstractFileByPath(filePath);
         if (!(file instanceof TFile)) return;
 
@@ -404,7 +409,20 @@ export default class NotificatorPlugin extends Plugin {
         
         let lines = oldSource.trim().split('\n');
         let mainLine = lines[0];
-        if (newTargetTime) {
+        
+        if (statusDetail === 'ok status' && recurrence) {
+            const currentDateTimeMatch = mainLine.match(/^\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}/);
+            if (currentDateTimeMatch) {
+                const currentDateTime = DateTime.fromFormat(currentDateTimeMatch[0], 'dd.MM.yyyy HH:mm');
+                const nextDateTime = this.calculateNextOccurrence(currentDateTime, recurrence);
+                if (nextDateTime) {
+                    const nextTargetStr = nextDateTime.toFormat('dd.MM.yyyy HH:mm');
+                    mainLine = mainLine.replace(/^\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}/, nextTargetStr);
+                    lines[0] = mainLine;
+                    statusDetail = `completed and scheduled for ${nextTargetStr}`;
+                }
+            }
+        } else if (newTargetTime) {
             // Replace time in the first line
             mainLine = mainLine.replace(/^\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}/, newTargetTime);
             lines[0] = mainLine;
@@ -452,6 +470,56 @@ export default class NotificatorPlugin extends Plugin {
         });
     }
 
+    calculateNextOccurrence(current: DateTime, rule: string): DateTime | null {
+        rule = rule.toLowerCase().trim();
+        
+        // Match "every N weeks"
+        const everyWeeksMatch = rule.match(/every (\d+) weeks?/);
+        if (everyWeeksMatch) {
+            const weeks = parseInt(everyWeeksMatch[1]);
+            return current.plus({ weeks });
+        }
+
+        // Match "every N months" or "every month on N"
+        const everyMonthOnMatch = rule.match(/every month on (\d+)/);
+        if (everyMonthOnMatch) {
+            const day = parseInt(everyMonthOnMatch[1]);
+            let next = current.plus({ months: 1 }).set({ day });
+            if (!next.isValid) { // e.g. Feb 31
+                 next = current.plus({ months: 1 }).endOf('month').startOf('day').set({ hour: current.hour, minute: current.minute });
+            }
+            return next;
+        }
+
+        if (rule.includes('every month')) {
+            return current.plus({ months: 1 });
+        }
+
+        // Match "every [day of week]"
+        const days = {
+            'monday': 1, 'tuesday': 2, 'wednesday': 3, 'thursday': 4, 'friday': 5, 'saturday': 6, 'sunday': 7,
+            'пн': 1, 'вт': 2, 'ср': 3, 'чт': 4, 'пт': 5, 'сб': 6, 'вс': 7,
+            'понедельник': 1, 'вторник': 2, 'среда': 3, 'четверг': 4, 'пятница': 5, 'суббота': 6, 'воскресенье': 7
+        };
+
+        for (const [dayName, dayNum] of Object.entries(days)) {
+            if (rule.includes(dayName)) {
+                let next = current.plus({ days: 1 });
+                while (next.weekday !== dayNum) {
+                    next = next.plus({ days: 1 });
+                }
+                return next;
+            }
+        }
+
+        // Default: plus 1 day if "every day" or unknown
+        if (rule.includes('day')) {
+            return current.plus({ days: 1 });
+        }
+
+        return null;
+    }
+
     showSystemNotification(n: NotificationData, isReminder: boolean = false) {
         const title = isReminder ? "Notificator Reminder:" : "Notificator";
         const notification = new Notification(title, {
@@ -470,10 +538,13 @@ export default class NotificatorPlugin extends Plugin {
 
 class NotificationModal extends Modal {
     plugin: NotificatorPlugin;
-    result: { date: string, time: string, comment: string, emoji: string };
-    onSubmit: (result: { date: string, time: string, comment: string, emoji: string }) => void;
+    result: { date: string, time: string, comment: string, emoji: string, recurrence: string };
+    onSubmit: (result: { date: string, time: string, comment: string, emoji: string, recurrence: string }) => void;
 
-    constructor(app: App, plugin: NotificatorPlugin, onSubmit: (result: { date: string, time: string, comment: string, emoji: string }) => void) {
+    recurrenceType: string = 'none';
+    recurrenceValue: string = '';
+
+    constructor(app: App, plugin: NotificatorPlugin, onSubmit: (result: { date: string, time: string, comment: string, emoji: string, recurrence: string }) => void) {
         super(app);
         this.plugin = plugin;
         this.onSubmit = onSubmit;
@@ -481,7 +552,8 @@ class NotificationModal extends Modal {
             date: DateTime.now().toFormat('yyyy-MM-dd'), 
             time: DateTime.now().toFormat('HH:mm'), 
             comment: '',
-            emoji: ''
+            emoji: '',
+            recurrence: ''
         };
     }
 
@@ -535,12 +607,88 @@ class NotificationModal extends Modal {
                 text.onChange((value) => (this.result.comment = value));
             });
 
+        contentEl.createEl("h3", { text: "Recurrence" });
+
+        const recurrenceContainer = contentEl.createDiv();
+        
+        const renderRecurrenceOptions = () => {
+            recurrenceContainer.empty();
+            
+            new Setting(recurrenceContainer)
+                .setName("Type")
+                .addDropdown(dropdown => {
+                    dropdown
+                        .addOption('none', 'None')
+                        .addOption('daily', 'Every day')
+                        .addOption('weekly', 'Weekly')
+                        .addOption('monthly', 'Monthly')
+                        .addOption('custom', 'Custom')
+                        .setValue(this.recurrenceType)
+                        .onChange(value => {
+                            this.recurrenceType = value;
+                            this.recurrenceValue = '';
+                            if (value === 'weekly') this.recurrenceValue = 'monday';
+                            if (value === 'monthly') this.recurrenceValue = '1';
+                            renderRecurrenceOptions();
+                        });
+                });
+
+            if (this.recurrenceType === 'weekly') {
+                new Setting(recurrenceContainer)
+                    .setName("Day of week")
+                    .addDropdown(dropdown => {
+                        dropdown
+                            .addOption('monday', 'Monday')
+                            .addOption('tuesday', 'Tuesday')
+                            .addOption('wednesday', 'Wednesday')
+                            .addOption('thursday', 'Thursday')
+                            .addOption('friday', 'Friday')
+                            .addOption('saturday', 'Saturday')
+                            .addOption('sunday', 'Sunday')
+                            .setValue(this.recurrenceValue)
+                            .onChange(value => this.recurrenceValue = value);
+                    });
+            } else if (this.recurrenceType === 'monthly') {
+                new Setting(recurrenceContainer)
+                    .setName("Day of month")
+                    .addText(text => {
+                        text.setPlaceholder("1-31")
+                            .setValue(this.recurrenceValue)
+                            .onChange(value => this.recurrenceValue = value);
+                    });
+            } else if (this.recurrenceType === 'custom') {
+                new Setting(recurrenceContainer)
+                    .setName("Custom rule")
+                    .setDesc("e.g., every 2 weeks")
+                    .addText(text => {
+                        text.setPlaceholder("every 2 weeks")
+                            .setValue(this.recurrenceValue)
+                            .onChange(value => this.recurrenceValue = value);
+                    });
+            }
+        };
+
+        renderRecurrenceOptions();
+
         new Setting(contentEl)
             .addButton((btn) =>
                 btn
                     .setButtonText("Create")
                     .setCta()
                     .onClick(() => {
+                        // Build recurrence string
+                        if (this.recurrenceType === 'none') {
+                            this.result.recurrence = '';
+                        } else if (this.recurrenceType === 'daily') {
+                            this.result.recurrence = 'every day';
+                        } else if (this.recurrenceType === 'weekly') {
+                            this.result.recurrence = `every ${this.recurrenceValue}`;
+                        } else if (this.recurrenceType === 'monthly') {
+                            this.result.recurrence = `every month on ${this.recurrenceValue}`;
+                        } else if (this.recurrenceType === 'custom') {
+                            this.result.recurrence = this.recurrenceValue;
+                        }
+
                         // Convert ISO date to DD.MM.YYYY
                         const d = DateTime.fromISO(this.result.date);
                         const formattedDate = d.toFormat('dd.MM.yyyy');
