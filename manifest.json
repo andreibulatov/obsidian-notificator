@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-notificator",
+	"name": "Notificator",
+ "version": "1.0.12",
+	"minAppVersion": "0.15.0",
+	"description": "System notifications for Obsidian notes across Mac, Windows, and Android.",
+	"author": "Junie",
+	"authorUrl": "https://github.com",
+	"isDesktopOnly": false
+}
